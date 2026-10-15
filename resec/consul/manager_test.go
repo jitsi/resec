@@ -1,6 +1,7 @@
 package consul
 
 import (
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -17,6 +18,7 @@ type fakeClient struct {
 	registered   []*consulapi.AgentServiceRegistration
 	deregistered []string
 	ttlUpdates   []string
+	registerErr  error
 	health       func() ([]*consulapi.ServiceEntry, *consulapi.QueryMeta, error)
 }
 
@@ -27,6 +29,9 @@ func (c *fakeClient) LockOpts(opts *consulapi.LockOptions) (*consulapi.Lock, err
 func (c *fakeClient) ServiceRegister(service *consulapi.AgentServiceRegistration) error {
 	c.Lock()
 	defer c.Unlock()
+	if c.registerErr != nil {
+		return c.registerErr
+	}
 	c.registered = append(c.registered, service)
 	return nil
 }
@@ -69,10 +74,11 @@ func newTestManager(client *fakeClient) *Manager {
 				"slave":  {"readonly"},
 			},
 		},
-		logger:  log.WithField("testing", true),
-		stateCh: make(chan state.Consul, 100),
-		stopCh:  make(chan interface{}),
-		state:   &state.Consul{Ready: true, Healthy: true},
+		logger:    log.WithField("testing", true),
+		stateCh:   make(chan state.Consul, 100),
+		commandCh: make(chan Command, 10),
+		stopCh:    make(chan interface{}),
+		state:     &state.Consul{Ready: true, Healthy: true},
 	}
 }
 
@@ -111,11 +117,33 @@ func TestManager_StepDownForgetsSelfAsMaster(t *testing.T) {
 
 	assert.False(t, m.state.Master)
 	assert.True(t, m.state.NoMasterElected())
-	assert.Equal(t, []string{"resec-redis@10.0.0.1:6379"}, client.deregistered)
+	assert.Equal(t, Command{name: DeregisterServiceCommand}, <-m.commandCh)
 
 	emitted := <-m.stateCh
 	assert.False(t, emitted.Master)
 	assert.True(t, emitted.NoMasterElected())
+}
+
+func TestManager_StepDownWhileWatcherSeesOwnEntry(t *testing.T) {
+	client := &fakeClient{
+		health: func() ([]*consulapi.ServiceEntry, *consulapi.QueryMeta, error) {
+			return []*consulapi.ServiceEntry{serviceEntry("10.0.0.1", 6379)}, &consulapi.QueryMeta{LastIndex: 5}, nil
+		},
+	}
+	m := newTestManager(client)
+	m.state.Master = true
+	defer close(m.stopCh)
+
+	go m.watchConsulMasterService()
+	waitForMaster(t, m, "10.0.0.1", 6379)
+
+	m.stepDown()
+
+	// keep polling; our own entry must never become the master again
+	time.Sleep(600 * time.Millisecond)
+	m.masterLock.Lock()
+	defer m.masterLock.Unlock()
+	assert.True(t, m.state.NoMasterElected())
 }
 
 func TestManager_UpdateServiceReRegistersAfterRoleChange(t *testing.T) {
@@ -127,7 +155,7 @@ func TestManager_UpdateServiceReRegistersAfterRoleChange(t *testing.T) {
 	assert.Len(t, client.registered, 1)
 	assert.Equal(t, []string{"master"}, client.registered[0].Tags)
 
-	// demoted while the deregistration did not happen (e.g. Consul returned an error)
+	// role flipped without deregisterService running, so checkID is still set
 	m.state.Master = false
 	m.setConsulCheckStatus(state.Redis{})
 	assert.Len(t, client.registered, 2)
@@ -137,6 +165,26 @@ func TestManager_UpdateServiceReRegistersAfterRoleChange(t *testing.T) {
 	m.setConsulCheckStatus(state.Redis{})
 	assert.Len(t, client.registered, 2)
 	assert.Len(t, client.ttlUpdates, 3)
+}
+
+func TestManager_UpdateServiceSkipsTTLWhenReRegisterFails(t *testing.T) {
+	client := &fakeClient{}
+	m := newTestManager(client)
+
+	m.state.Master = true
+	m.setConsulCheckStatus(state.Redis{})
+	assert.Len(t, client.ttlUpdates, 1)
+
+	// the check still belongs to the master-tagged entry, so passing it would keep that entry alive
+	client.registerErr = errors.New("Unexpected response code: 500")
+	m.state.Master = false
+	m.setConsulCheckStatus(state.Redis{})
+	assert.Len(t, client.ttlUpdates, 1)
+
+	client.registerErr = nil
+	m.setConsulCheckStatus(state.Redis{})
+	assert.Equal(t, []string{"readonly"}, client.registered[len(client.registered)-1].Tags)
+	assert.Len(t, client.ttlUpdates, 2)
 }
 
 func TestManager_WithoutOwnService(t *testing.T) {
@@ -170,12 +218,15 @@ func TestManager_WatcherIgnoresOwnStaleMasterEntry(t *testing.T) {
 
 func TestManager_WatcherReevaluatesUnchangedCatalogWithoutMaster(t *testing.T) {
 	var mu sync.Mutex
+	var once sync.Once
 	services := []*consulapi.ServiceEntry{}
+	firstPoll := make(chan struct{})
 
 	client := &fakeClient{
 		health: func() ([]*consulapi.ServiceEntry, *consulapi.QueryMeta, error) {
 			mu.Lock()
 			defer mu.Unlock()
+			once.Do(func() { close(firstPoll) })
 			return services, &consulapi.QueryMeta{LastIndex: 5}, nil
 		},
 	}
@@ -184,8 +235,8 @@ func TestManager_WatcherReevaluatesUnchangedCatalogWithoutMaster(t *testing.T) {
 
 	go m.watchConsulMasterService()
 
-	// let the watcher see the empty catalog and record its index
-	time.Sleep(300 * time.Millisecond)
+	// the first poll returns the empty catalog at index 5
+	<-firstPoll
 
 	// a master shows up without the index moving
 	mu.Lock()

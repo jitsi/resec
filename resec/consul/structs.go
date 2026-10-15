@@ -1,6 +1,7 @@
 package consul
 
 import (
+	"sync"
 	"time"
 
 	consulapi "github.com/hashicorp/consul/api"
@@ -21,6 +22,7 @@ type Manager struct {
 	stateCh      chan state.Consul // state channel used to notify the reconciler of changes
 	stopCh       chan interface{}  // internal channel used to stop all go-routines when gracefully shutting down
 	commandCh    chan Command
+	masterLock   sync.Mutex // guards state.Master and the master address between the lock and watcher goroutines
 }
 
 // Consul config used for internal state management

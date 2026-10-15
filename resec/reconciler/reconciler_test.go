@@ -309,8 +309,8 @@ func TestReconciler_SlaveOfDemotedSelfLinkNeverUp(t *testing.T) {
 	helper.consume()
 	defer helper.stop()
 
-	// a slave whose link was never up, timed locally past the limit,
-	// must stop serving traffic
+	// link never up; the redis manager's local timing reported 11s, past the
+	// 10s limit, so it must stop serving traffic
 	helper.
 		withConsulState(state.Consul{
 			Ready:      true,
