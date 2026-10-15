@@ -1,11 +1,14 @@
 # Build layer
-FROM golang:1.16 AS builder
+# Cross-compile on the build host so multi-arch builds don't run Go under emulation
+FROM --platform=$BUILDPLATFORM golang:1.16 AS builder
+ARG TARGETOS
+ARG TARGETARCH
 WORKDIR /go/src/github.com/seatgeek/resec
 COPY . .
 ARG RESEC_VERSION
 ENV RESEC_VERSION ${RESEC_VERSION:-local-dev}
 RUN echo $RESEC_VERSION
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-X 'main.Version=${RESEC_VERSION}'" -a -installsuffix cgo -o build/resec  .
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -ldflags="-X 'main.Version=${RESEC_VERSION}'" -a -installsuffix cgo -o build/resec  .
 
 # Run layer
 FROM alpine:latest
