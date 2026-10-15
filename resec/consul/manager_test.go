@@ -2,6 +2,7 @@ package consul
 
 import (
 	"errors"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -19,6 +20,8 @@ type fakeClient struct {
 	deregistered []string
 	ttlUpdates   []string
 	registerErr  error
+	nodeName     string
+	nodeNameErr  error
 	health       func() ([]*consulapi.ServiceEntry, *consulapi.QueryMeta, error)
 }
 
@@ -58,6 +61,10 @@ func (c *fakeClient) ServiceHealth(service, tag string, passingOnly bool, q *con
 	return c.health()
 }
 
+func (c *fakeClient) NodeName() (string, error) {
+	return c.nodeName, c.nodeNameErr
+}
+
 func newTestManager(client *fakeClient) *Manager {
 	return &Manager{
 		backoff: &backoff.Backoff{Min: time.Millisecond, Max: 10 * time.Millisecond},
@@ -86,6 +93,13 @@ func serviceEntry(address string, port int) *consulapi.ServiceEntry {
 	return &consulapi.ServiceEntry{
 		Node:    &consulapi.Node{Address: address},
 		Service: &consulapi.AgentService{Address: address, Port: port},
+	}
+}
+
+func portOnlyEntry(node, nodeAddress string, port int) *consulapi.ServiceEntry {
+	return &consulapi.ServiceEntry{
+		Node:    &consulapi.Node{Node: node, Address: nodeAddress},
+		Service: &consulapi.AgentService{ID: "resec-redis@:" + strconv.Itoa(port), Port: port},
 	}
 }
 
@@ -194,9 +208,45 @@ func TestManager_WithoutOwnService(t *testing.T) {
 
 	assert.Equal(t, []*consulapi.ServiceEntry{other}, m.withoutOwnService([]*consulapi.ServiceEntry{own, other}))
 
-	// without an announced host the entries can't be told apart
+	// without an announced host or node name the entries can't be told apart
 	m.config.announceHost = ""
 	assert.Equal(t, []*consulapi.ServiceEntry{own, other}, m.withoutOwnService([]*consulapi.ServiceEntry{own, other}))
+}
+
+func TestManager_WithoutOwnServiceByNodeName(t *testing.T) {
+	m := newTestManager(&fakeClient{})
+
+	// localhost redis-addr: port-only registration, Consul fills in the node IP
+	m.config.announceAddr = ":6379"
+	m.config.announceHost = ""
+	m.config.nodeName = "node-a"
+
+	own := portOnlyEntry("node-a", "10.0.0.1", 6379)
+	other := portOnlyEntry("node-b", "10.0.0.2", 6379)
+	// another resec on our node, e.g. a second Redis container
+	neighbour := portOnlyEntry("node-a", "10.0.0.1", 6380)
+
+	assert.Equal(t, []*consulapi.ServiceEntry{other, neighbour}, m.withoutOwnService([]*consulapi.ServiceEntry{own, other, neighbour}))
+}
+
+func TestManager_WatcherIgnoresOwnPortOnlyEntry(t *testing.T) {
+	client := &fakeClient{
+		nodeName: "node-a",
+		health: func() ([]*consulapi.ServiceEntry, *consulapi.QueryMeta, error) {
+			return []*consulapi.ServiceEntry{
+				portOnlyEntry("node-a", "10.0.0.1", 6379),
+				portOnlyEntry("node-b", "10.0.0.2", 6379),
+			}, &consulapi.QueryMeta{LastIndex: 5}, nil
+		},
+	}
+	m := newTestManager(client)
+	m.config.announceAddr = ":6379"
+	m.config.announceHost = ""
+	defer close(m.stopCh)
+
+	go m.watchConsulMasterService()
+
+	waitForMaster(t, m, "10.0.0.2", 6379)
 }
 
 func TestManager_WatcherIgnoresOwnStaleMasterEntry(t *testing.T) {

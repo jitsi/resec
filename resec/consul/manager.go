@@ -337,6 +337,7 @@ func (m *Manager) watchConsulMasterService() {
 			}
 
 			timer.Reset(duration)
+			m.lookupNodeName()
 			m.updateMaster(services, meta, q)
 		}
 	}
@@ -393,18 +394,37 @@ func (m *Manager) updateMaster(services []*consulapi.ServiceEntry, meta *consula
 	m.emit()
 }
 
-// withoutOwnService returns the service entries that do not point at the local Redis.
-// Without an announced host the service address is empty and Consul uses the node IP,
-// which we do not know, so we cannot tell our own entry apart.
-func (m *Manager) withoutOwnService(services []*consulapi.ServiceEntry) []*consulapi.ServiceEntry {
-	if m.config.announceHost == "" {
-		return services
+// lookupNodeName reads the name of the local Consul agent node once
+func (m *Manager) lookupNodeName() {
+	if m.config.nodeName != "" {
+		return
 	}
+
+	name, err := m.client.NodeName()
+	if err != nil {
+		m.logger.Warnf("Could not read the local Consul node name: %v", err)
+		return
+	}
+
+	m.config.nodeName = name
+}
+
+// withoutOwnService returns the service entries that do not point at the local Redis.
+// Match on Consul node and service ID: with a localhost redis-addr (e.g. in Docker)
+// the service address is empty and Consul uses the node IP, which we do not know.
+func (m *Manager) withoutOwnService(services []*consulapi.ServiceEntry) []*consulapi.ServiceEntry {
+	ownID := m.getConsulServiceID() + "@" + m.config.announceAddr
 
 	others := make([]*consulapi.ServiceEntry, 0, len(services))
 	for _, service := range services {
-		if service.Service.Address == m.config.announceHost && service.Service.Port == m.config.announcePort {
-			continue
+		if m.config.nodeName != "" {
+			if service.Node.Node == m.config.nodeName && service.Service.ID == ownID {
+				continue
+			}
+		} else if m.config.announceHost != "" {
+			if service.Service.Address == m.config.announceHost && service.Service.Port == m.config.announcePort {
+				continue
+			}
 		}
 
 		others = append(others, service)

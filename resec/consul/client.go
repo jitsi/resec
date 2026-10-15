@@ -12,6 +12,7 @@ type consulClient interface {
 	ServiceDeregister(serviceID string) error
 	UpdateTTL(checkID, output, status string) error
 	ServiceHealth(service, tag string, passingOnly bool, q *consulapi.QueryOptions) ([]*consulapi.ServiceEntry, *consulapi.QueryMeta, error)
+	NodeName() (string, error)
 }
 
 // live client operates on a real consul Client, talking to Consul API directly
@@ -41,4 +42,8 @@ func (c *liveClient) UpdateTTL(checkID, output, status string) error {
 
 func (c *liveClient) ServiceHealth(service, tag string, passingOnly bool, q *consulapi.QueryOptions) ([]*consulapi.ServiceEntry, *consulapi.QueryMeta, error) {
 	return c.client.Health().Service(service, tag, passingOnly, q)
+}
+
+func (c *liveClient) NodeName() (string, error) {
+	return c.client.Agent().NodeName()
 }

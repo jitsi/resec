@@ -39,6 +39,7 @@ type config struct {
 	lockSessionName          string              // Name of the session that we use to claim the lock
 	voluntarilyReleaseLockCh chan interface{}    // Release the lock if this channel is closed (if we have it, otherwise NOOP)
 	lockTTL                  time.Duration       // How frequently do we ned to keep-alive our lock to have it not expire
+	nodeName                 string              // name of the local Consul agent node
 	serviceID                string              // Consul service ID
 	serviceName              string              // Consul service Name
 	serviceNamePrefix        string              // Consul service name (prefix)
