@@ -161,6 +161,16 @@ func (r *Reconciler) apply(state resultType) {
 	case ResultNoMasterElected:
 		r.logger.Warn("Currently no master Redis is elected in Consul catalog, can't enslave local Redis")
 
+		// A demoted master still accepts writes from clients that are already
+		// connected, and the SLAVEOF that follows once a master is known discards
+		// them. Kick the clients so they re-resolve the master through Consul,
+		// where this node is no longer registered. This repeats on every
+		// reconcile tick for as long as no master is known, on purpose.
+		if r.redisState.IsRedisMaster() {
+			r.logger.Warn("Redis still runs as master without holding the lock, disconnecting its clients")
+			r.sendRedisCommand(redis.DisconnectUsersCommand)
+		}
+
 	case ResultRunAsSlave:
 		r.logger.Info("Reconfigure Redis as slave")
 		r.sendRedisCommand(redis.RunAsSlaveCommand)

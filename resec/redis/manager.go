@@ -105,6 +105,16 @@ func (m *Manager) CommandRunner() {
 				if err := m.disconnectUsers(); err != nil {
 					m.logger.Error(err)
 				}
+
+			case DisconnectUsersCommand:
+				if !m.state.Ready {
+					m.logger.Warnf("Got 'disconnectUsers' command, but Redis is not ready yet - ignoring")
+					continue
+				}
+
+				if err := m.disconnectUsers(); err != nil {
+					m.logger.Error(err)
+				}
 			}
 		}
 	}

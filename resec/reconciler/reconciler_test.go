@@ -287,7 +287,8 @@ func TestReconciler_DemotedMasterWaitsForNewMaster(t *testing.T) {
 	defer helper.stop()
 
 	// we just lost the Consul lock while Redis still runs as master; with the
-	// cached master cleared, Redis must not be enslaved until a new master is known
+	// cached master cleared, Redis must not be enslaved until a new master is
+	// known, but its clients must be kicked so they stop writing to it
 	helper.
 		withConsulState(state.Consul{
 			Ready:   true,
@@ -299,6 +300,35 @@ func TestReconciler_DemotedMasterWaitsForNewMaster(t *testing.T) {
 			Healthy: true,
 			Info: state.RedisStatus{
 				Role: "master",
+			},
+		}).
+		expectRedisCommands(
+			redis.DisconnectUsersCommand,
+		).
+		eval(ResultNoMasterElected)
+}
+
+func TestReconciler_SlaveWithoutMasterKeepsClients(t *testing.T) {
+	helper := newTestReconciler(t)
+	helper.consume()
+	defer helper.stop()
+
+	// a node that is already a slave serves reads; losing sight of the master
+	// in Consul is no reason to disconnect its clients
+	helper.
+		withConsulState(state.Consul{
+			Ready:   true,
+			Healthy: true,
+			Master:  false,
+		}).
+		withRedisState(state.Redis{
+			Ready:   true,
+			Healthy: true,
+			Info: state.RedisStatus{
+				Role:         "slave",
+				MasterHost:   "10.0.0.2",
+				MasterPort:   6379,
+				MasterLinkUp: true,
 			},
 		}).
 		eval(ResultNoMasterElected)

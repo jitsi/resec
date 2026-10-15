@@ -22,7 +22,12 @@ type Manager struct {
 	stateCh      chan state.Consul // state channel used to notify the reconciler of changes
 	stopCh       chan interface{}  // internal channel used to stop all go-routines when gracefully shutting down
 	commandCh    chan Command
-	masterLock   sync.Mutex // guards state.Master and the master address between the lock and watcher goroutines
+	// masterLock guards state.Master, MasterAddr and MasterPort. It is taken by
+	// the lock goroutine (acquire/stepDown), the watcher (updateMaster) and the
+	// command runner's isMaster() reads. emit() runs under it so state updates
+	// reach the reconciler in order. Healthy and Ready are still written
+	// unguarded by handleConsulError and start, as before.
+	masterLock sync.Mutex
 }
 
 // Consul config used for internal state management

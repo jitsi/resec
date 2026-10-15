@@ -61,7 +61,7 @@ func (m *Manager) continuouslyAcquireConsulLeadership() {
 // redis Master node
 func (m *Manager) acquireConsulLeadership() {
 	// if we already hold the lock, we can't acquire it again
-	if m.state.Master {
+	if m.isMaster() {
 		m.logger.Debug("We already hold the lock, can't acquire it again")
 		return
 	}
@@ -153,7 +153,20 @@ func (m *Manager) acquireConsulLeadership() {
 
 // stepDown updates our state after we no longer hold the lock
 func (m *Manager) stepDown() {
+	// Stop advertising as master right away; the reconciler registers us again
+	// with the slave tags once we follow the new master. The command runner owns
+	// the service registration, so hand it the deregistration instead of racing
+	// it. Queue it before the state change so it runs after any register the
+	// reconciler already queued for the old role, and before any it queues for
+	// the new one.
+	select {
+	case m.commandCh <- Command{name: DeregisterServiceCommand}:
+	case <-m.stopCh:
+	}
+
 	m.masterLock.Lock()
+	defer m.masterLock.Unlock()
+
 	m.state.Master = false
 
 	// The cached master is this node. Keeping it makes the reconciler enslave
@@ -161,20 +174,19 @@ func (m *Manager) stepDown() {
 	m.state.MasterAddr = ""
 	m.state.MasterPort = 0
 	m.emit()
-	m.masterLock.Unlock()
+}
 
-	// Stop advertising as master right away; the reconciler registers us again
-	// with the slave tags once we follow the new master. The command runner owns
-	// the service registration, so hand it the deregistration instead of racing it.
-	select {
-	case m.commandCh <- Command{name: DeregisterServiceCommand}:
-	case <-m.stopCh:
-	}
+// isMaster reads state.Master under the lock shared with the watcher
+func (m *Manager) isMaster() bool {
+	m.masterLock.Lock()
+	defer m.masterLock.Unlock()
+
+	return m.state.Master
 }
 
 // releaseConsulLock stops consul lock handler")
 func (m *Manager) releaseConsulLock() {
-	if m.state.Master == false {
+	if !m.isMaster() {
 		m.logger.Debug("Can't release Consul lock, we don't have it")
 		return
 	}
@@ -186,7 +198,7 @@ func (m *Manager) releaseConsulLock() {
 // getReplicationStatus will return current replication status
 // the default value is 'slave' - only if we hold the lock will 'master' be returned
 func (m *Manager) getReplicationStatus() string {
-	if m.state.Master {
+	if m.isMaster() {
 		return "master"
 	}
 

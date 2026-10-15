@@ -3,10 +3,11 @@ package redis
 import "github.com/seatgeek/resec/resec/state"
 
 const (
-	StartCommand       = CommandName("start")
-	StopCommand        = CommandName("stop")
-	RunAsSlaveCommand  = CommandName("run_as_slave")
-	RunAsMasterCommand = CommandName("run_as_master")
+	StartCommand           = CommandName("start")
+	StopCommand            = CommandName("stop")
+	RunAsSlaveCommand      = CommandName("run_as_slave")
+	RunAsMasterCommand     = CommandName("run_as_master")
+	DisconnectUsersCommand = CommandName("disconnect_users")
 )
 
 type CommandName string
