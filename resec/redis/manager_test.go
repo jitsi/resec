@@ -143,3 +143,53 @@ repl_backlog_histlen:1526`),
 func newlinefix(s string) string {
 	return strings.Replace(s, "\n", "\r\n", -1)
 }
+
+func TestManager_trackMasterLinkDown(t *testing.T) {
+	start := time.Unix(1000, 0)
+	down := func(reported time.Duration) state.RedisStatus {
+		return state.RedisStatus{
+			Role:                "slave",
+			MasterHost:          "10.0.0.2",
+			MasterPort:          6379,
+			MasterLinkDownSince: reported,
+		}
+	}
+
+	m := &Manager{}
+
+	// Redis reports -1 for a link that was never up (e.g. a demoted master)
+	info := down(-1 * time.Second)
+	m.trackMasterLinkDown(&info, start)
+	assert.Equal(t, time.Duration(0), info.MasterLinkDownSince)
+
+	info = down(-1 * time.Second)
+	m.trackMasterLinkDown(&info, start.Add(15*time.Second))
+	assert.Equal(t, 15*time.Second, info.MasterLinkDownSince)
+
+	// a larger value reported by Redis wins
+	info = down(60 * time.Second)
+	m.trackMasterLinkDown(&info, start.Add(16*time.Second))
+	assert.Equal(t, 60*time.Second, info.MasterLinkDownSince)
+
+	// pointing at another master starts a new outage
+	info = down(-1 * time.Second)
+	info.MasterHost = "10.0.0.3"
+	m.trackMasterLinkDown(&info, start.Add(20*time.Second))
+	assert.Equal(t, time.Duration(0), info.MasterLinkDownSince)
+
+	// the link coming up resets the outage
+	up := state.RedisStatus{Role: "slave", MasterHost: "10.0.0.3", MasterPort: 6379, MasterLinkUp: true}
+	m.trackMasterLinkDown(&up, start.Add(25*time.Second))
+	assert.Equal(t, time.Duration(0), up.MasterLinkDownSince)
+
+	info = down(-1 * time.Second)
+	info.MasterHost = "10.0.0.3"
+	m.trackMasterLinkDown(&info, start.Add(30*time.Second))
+	assert.Equal(t, time.Duration(0), info.MasterLinkDownSince)
+}
+
+func TestManager_runAsSlaveRefusesItself(t *testing.T) {
+	m := &Manager{config: &Config{Address: "10.0.0.1:6379"}}
+
+	assert.Error(t, m.runAsSlave("10.0.0.1", 6379))
+}

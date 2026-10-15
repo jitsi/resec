@@ -61,7 +61,7 @@ func (m *Manager) continuouslyAcquireConsulLeadership() {
 // redis Master node
 func (m *Manager) acquireConsulLeadership() {
 	// if we already hold the lock, we can't acquire it again
-	if m.state.Master {
+	if m.isMaster() {
 		m.logger.Debug("We already hold the lock, can't acquire it again")
 		return
 	}
@@ -99,8 +99,10 @@ func (m *Manager) acquireConsulLeadership() {
 
 		m.logger.Info("Lock successfully acquired")
 
+		m.masterLock.Lock()
 		m.state.Master = true
 		m.emit()
+		m.masterLock.Unlock()
 	}
 
 	//
@@ -120,8 +122,7 @@ func (m *Manager) acquireConsulLeadership() {
 			m.logger.Info("Consul Lock successfully released")
 		}
 
-		m.state.Master = false
-		m.emit()
+		m.stepDown()
 	}()
 
 	// Wait for changes to Consul Lock
@@ -150,9 +151,42 @@ func (m *Manager) acquireConsulLeadership() {
 	}
 }
 
+// stepDown updates our state after we no longer hold the lock
+func (m *Manager) stepDown() {
+	// Stop advertising as master right away; the reconciler registers us again
+	// with the slave tags once we follow the new master. The command runner owns
+	// the service registration, so hand it the deregistration instead of racing
+	// it. Queue it before the state change so it runs after any register the
+	// reconciler already queued for the old role, and before any it queues for
+	// the new one.
+	select {
+	case m.commandCh <- Command{name: DeregisterServiceCommand}:
+	case <-m.stopCh:
+	}
+
+	m.masterLock.Lock()
+	defer m.masterLock.Unlock()
+
+	m.state.Master = false
+
+	// The cached master is this node. Keeping it makes the reconciler enslave
+	// the local Redis to itself, so wait for the watcher to find the new master.
+	m.state.MasterAddr = ""
+	m.state.MasterPort = 0
+	m.emit()
+}
+
+// isMaster reads state.Master under the lock shared with the watcher
+func (m *Manager) isMaster() bool {
+	m.masterLock.Lock()
+	defer m.masterLock.Unlock()
+
+	return m.state.Master
+}
+
 // releaseConsulLock stops consul lock handler")
 func (m *Manager) releaseConsulLock() {
-	if m.state.Master == false {
+	if !m.isMaster() {
 		m.logger.Debug("Can't release Consul lock, we don't have it")
 		return
 	}
@@ -164,7 +198,7 @@ func (m *Manager) releaseConsulLock() {
 // getReplicationStatus will return current replication status
 // the default value is 'slave' - only if we hold the lock will 'master' be returned
 func (m *Manager) getReplicationStatus() string {
-	if m.state.Master {
+	if m.isMaster() {
 		return "master"
 	}
 
@@ -224,6 +258,7 @@ func (m *Manager) registerService(redisState state.Redis) {
 		return
 	}
 
+	m.config.serviceRole = replicationStatus
 	m.logger.Infof("Registered service %s (%s) with address %s:%d", serviceInfo.Name, serviceInfo.ID, serviceInfo.Address, serviceInfo.Port)
 
 	check := &consulapi.AgentCheckRegistration{
@@ -250,12 +285,21 @@ func (m *Manager) deregisterService() {
 
 	m.config.serviceID = ""
 	m.config.checkID = ""
+	m.config.serviceRole = ""
 }
 
 // setConsulCheckStatus sets consul status check TTL and output
 func (m *Manager) setConsulCheckStatus(redisState state.Redis) {
-	if m.config.checkID == "" {
+	// Re-register when the registered role is stale or the last register failed.
+	// The check ID is the same for both roles, so a TTL update would keep a
+	// master-tagged entry passing after we lost the lock.
+	if m.config.checkID == "" || m.config.serviceRole != m.getReplicationStatus() {
 		m.registerService(redisState)
+
+		if m.config.serviceRole != m.getReplicationStatus() {
+			m.logger.Warn("Service is not registered with the current role, skipping TTL update")
+			return
+		}
 	}
 
 	m.logger.Debug("Updating Check TTL for service")
@@ -305,43 +349,100 @@ func (m *Manager) watchConsulMasterService() {
 			}
 
 			timer.Reset(duration)
-
-			if q.WaitIndex == meta.LastIndex {
-				m.logger.Debugf("No change in master service health")
-				continue
-			}
-
-			q.WaitIndex = meta.LastIndex
-
-			if len(services) == 0 {
-				m.logger.Warn("No (healthy) master service found in Consul catalog")
-				continue
-			}
-
-			if len(services) > 1 {
-				m.logger.Error("More than 1 (healthy) master service found in Consul catalog")
-				continue
-			}
-
-			master := services[0]
-
-			if m.state.MasterAddr == master.Service.Address && m.state.MasterPort == master.Service.Port {
-				m.logger.Debugf("No change in master service configuration")
-				continue
-			}
-
-			// handle If master is registred in consul with port only
-			// Use node IP insted of service IP
-			if master.Service.Address != "" {
-				m.state.MasterAddr = master.Service.Address
-			} else {
-				m.state.MasterAddr = master.Node.Address
-			}
-
-			m.state.MasterPort = master.Service.Port
-			m.emit()
+			m.lookupNodeName()
+			m.updateMaster(services, meta, q)
 		}
 	}
+}
+
+// updateMaster sets the master from the healthy master services in the catalog
+func (m *Manager) updateMaster(services []*consulapi.ServiceEntry, meta *consulapi.QueryMeta, q *consulapi.QueryOptions) {
+	// stepDown runs on the lock goroutine. Without the lock, a poll that started while
+	// we were master can write our own address back after stepDown cleared it.
+	m.masterLock.Lock()
+	defer m.masterLock.Unlock()
+
+	// With no known master (e.g. right after losing the lock) evaluate the
+	// catalog even if it did not change, so we pick up the current master.
+	if q.WaitIndex == meta.LastIndex && !m.state.NoMasterElected() {
+		m.logger.Debugf("No change in master service health")
+		return
+	}
+
+	q.WaitIndex = meta.LastIndex
+
+	// A stale master entry of our own must not count, or it blocks us from
+	// ever seeing the real master once we lost the lock.
+	if !m.state.Master {
+		services = m.withoutOwnService(services)
+	}
+
+	if len(services) == 0 {
+		m.logger.Warn("No (healthy) master service found in Consul catalog")
+		return
+	}
+
+	if len(services) > 1 {
+		m.logger.Error("More than 1 (healthy) master service found in Consul catalog")
+		return
+	}
+
+	master := services[0]
+
+	if m.state.MasterAddr == master.Service.Address && m.state.MasterPort == master.Service.Port {
+		m.logger.Debugf("No change in master service configuration")
+		return
+	}
+
+	// handle If master is registred in consul with port only
+	// Use node IP insted of service IP
+	if master.Service.Address != "" {
+		m.state.MasterAddr = master.Service.Address
+	} else {
+		m.state.MasterAddr = master.Node.Address
+	}
+
+	m.state.MasterPort = master.Service.Port
+	m.emit()
+}
+
+// lookupNodeName reads the name of the local Consul agent node once
+func (m *Manager) lookupNodeName() {
+	if m.config.nodeName != "" {
+		return
+	}
+
+	name, err := m.client.NodeName()
+	if err != nil {
+		m.logger.Warnf("Could not read the local Consul node name: %v", err)
+		return
+	}
+
+	m.config.nodeName = name
+}
+
+// withoutOwnService returns the service entries that do not point at the local Redis.
+// Match on Consul node and service ID: with a localhost redis-addr (e.g. in Docker)
+// the service address is empty and Consul uses the node IP, which we do not know.
+func (m *Manager) withoutOwnService(services []*consulapi.ServiceEntry) []*consulapi.ServiceEntry {
+	ownID := m.getConsulServiceID() + "@" + m.config.announceAddr
+
+	others := make([]*consulapi.ServiceEntry, 0, len(services))
+	for _, service := range services {
+		if m.config.nodeName != "" {
+			if service.Node.Node == m.config.nodeName && service.Service.ID == ownID {
+				continue
+			}
+		} else if m.config.announceHost != "" {
+			if service.Service.Address == m.config.announceHost && service.Service.Port == m.config.announcePort {
+				continue
+			}
+		}
+
+		others = append(others, service)
+	}
+
+	return others
 }
 
 // handleConsulError is the error handler

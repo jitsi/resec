@@ -1,6 +1,8 @@
 package redis
 
 import (
+	"time"
+
 	"github.com/go-redis/redis"
 	"github.com/jpillora/backoff"
 	"github.com/seatgeek/resec/resec/state"
@@ -17,6 +19,8 @@ type Manager struct {
 	commandCh      chan Command
 	stopCh         chan interface{}
 	watcherRunning bool
+	linkDownSince  time.Time // when we first saw the master link down
+	linkDownMaster string    // master (host:port) the link was down to
 }
 
 type Config struct {

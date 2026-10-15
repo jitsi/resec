@@ -1,6 +1,7 @@
 package consul
 
 import (
+	"sync"
 	"time"
 
 	consulapi "github.com/hashicorp/consul/api"
@@ -21,6 +22,12 @@ type Manager struct {
 	stateCh      chan state.Consul // state channel used to notify the reconciler of changes
 	stopCh       chan interface{}  // internal channel used to stop all go-routines when gracefully shutting down
 	commandCh    chan Command
+	// masterLock guards state.Master, MasterAddr and MasterPort. It is taken by
+	// the lock goroutine (acquire/stepDown), the watcher (updateMaster) and the
+	// command runner's isMaster() reads. emit() runs under it so state updates
+	// reach the reconciler in order. Healthy and Ready are still written
+	// unguarded by handleConsulError and start, as before.
+	masterLock sync.Mutex
 }
 
 // Consul config used for internal state management
@@ -37,9 +44,11 @@ type config struct {
 	lockSessionName          string              // Name of the session that we use to claim the lock
 	voluntarilyReleaseLockCh chan interface{}    // Release the lock if this channel is closed (if we have it, otherwise NOOP)
 	lockTTL                  time.Duration       // How frequently do we ned to keep-alive our lock to have it not expire
+	nodeName                 string              // name of the local Consul agent node
 	serviceID                string              // Consul service ID
 	serviceName              string              // Consul service Name
 	serviceNamePrefix        string              // Consul service name (prefix)
+	serviceRole              string              // role ("master" or "slave") the service is currently registered with
 	serviceTagsByRole        map[string][]string // Tags to include for a service, depending on the role we have
 	serviceTTL               time.Duration
 }
