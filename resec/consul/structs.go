@@ -40,6 +40,7 @@ type config struct {
 	serviceID                string              // Consul service ID
 	serviceName              string              // Consul service Name
 	serviceNamePrefix        string              // Consul service name (prefix)
+	serviceRole              string              // role ("master" or "slave") the service is currently registered with
 	serviceTagsByRole        map[string][]string // Tags to include for a service, depending on the role we have
 	serviceTTL               time.Duration
 }

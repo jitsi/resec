@@ -2,6 +2,7 @@ package redis
 
 import (
 	"fmt"
+	"net"
 	"strconv"
 	"strings"
 	"time"
@@ -28,6 +29,10 @@ func (m *Manager) runAsMaster() error {
 
 // runAsSlave sets the instance to be a slave for the master
 func (m *Manager) runAsSlave(masterAddress string, masterPort int) error {
+	if net.JoinHostPort(masterAddress, strconv.Itoa(masterPort)) == m.config.Address {
+		return fmt.Errorf("Refusing to enslave redis to itself (%s)", m.config.Address)
+	}
+
 	m.logger.Infof("Enslaving redis to be slave of %s:%d", masterAddress, masterPort)
 
 	if err := m.client.SlaveOf(masterAddress, strconv.Itoa(masterPort)).Err(); err != nil {
@@ -144,6 +149,7 @@ func (m *Manager) watchStatus() {
 
 			// Parse the "info" result from Redis
 			info := m.parseInfoResult(result)
+			m.trackMasterLinkDown(&info, time.Now())
 
 			// If Redis is loading data from disk, do not mark us as healthy
 			// If Redis is _not_ loading data from disk, we're healthy
@@ -157,6 +163,31 @@ func (m *Manager) watchStatus() {
 			m.state.InfoString = result
 			m.emit()
 		}
+	}
+}
+
+// trackMasterLinkDown times a down master link locally. Redis reports
+// master_link_down_since_seconds:-1 when the link was never up (e.g. a demoted
+// master), which would keep the "link down too long" check from ever firing.
+func (m *Manager) trackMasterLinkDown(info *state.RedisStatus, now time.Time) {
+	master := net.JoinHostPort(info.MasterHost, strconv.Itoa(info.MasterPort))
+
+	if info.Role != "slave" || info.MasterLinkUp || master != m.linkDownMaster {
+		m.linkDownSince = time.Time{}
+		m.linkDownMaster = ""
+	}
+
+	if info.Role != "slave" || info.MasterLinkUp {
+		return
+	}
+
+	if m.linkDownSince.IsZero() {
+		m.linkDownSince = now
+		m.linkDownMaster = master
+	}
+
+	if observed := now.Sub(m.linkDownSince); observed > info.MasterLinkDownSince {
+		info.MasterLinkDownSince = observed
 	}
 }
 

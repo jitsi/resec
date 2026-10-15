@@ -120,8 +120,7 @@ func (m *Manager) acquireConsulLeadership() {
 			m.logger.Info("Consul Lock successfully released")
 		}
 
-		m.state.Master = false
-		m.emit()
+		m.stepDown()
 	}()
 
 	// Wait for changes to Consul Lock
@@ -148,6 +147,22 @@ func (m *Manager) acquireConsulLeadership() {
 			return
 		}
 	}
+}
+
+// stepDown updates our state after we no longer hold the lock
+func (m *Manager) stepDown() {
+	m.state.Master = false
+
+	// The cached master is this node. Keeping it makes the reconciler enslave
+	// the local Redis to itself, so wait for the watcher to find the new master.
+	m.state.MasterAddr = ""
+	m.state.MasterPort = 0
+
+	// Stop advertising as master right away; the reconciler registers us again
+	// with the slave tags once we follow the new master.
+	m.deregisterService()
+
+	m.emit()
 }
 
 // releaseConsulLock stops consul lock handler")
@@ -224,6 +239,7 @@ func (m *Manager) registerService(redisState state.Redis) {
 		return
 	}
 
+	m.config.serviceRole = replicationStatus
 	m.logger.Infof("Registered service %s (%s) with address %s:%d", serviceInfo.Name, serviceInfo.ID, serviceInfo.Address, serviceInfo.Port)
 
 	check := &consulapi.AgentCheckRegistration{
@@ -250,11 +266,14 @@ func (m *Manager) deregisterService() {
 
 	m.config.serviceID = ""
 	m.config.checkID = ""
+	m.config.serviceRole = ""
 }
 
 // setConsulCheckStatus sets consul status check TTL and output
 func (m *Manager) setConsulCheckStatus(redisState state.Redis) {
-	if m.config.checkID == "" {
+	// Re-register on a role change too, otherwise a demoted master keeps its master
+	// tags and the TTL updates below keep that stale entry passing.
+	if m.config.checkID == "" || m.config.serviceRole != m.getReplicationStatus() {
 		m.registerService(redisState)
 	}
 
@@ -306,12 +325,20 @@ func (m *Manager) watchConsulMasterService() {
 
 			timer.Reset(duration)
 
-			if q.WaitIndex == meta.LastIndex {
+			// With no known master (e.g. right after losing the lock) evaluate the
+			// catalog even if it did not change, so we pick up the current master.
+			if q.WaitIndex == meta.LastIndex && !m.state.NoMasterElected() {
 				m.logger.Debugf("No change in master service health")
 				continue
 			}
 
 			q.WaitIndex = meta.LastIndex
+
+			// A stale master entry of our own must not count, or it blocks us from
+			// ever seeing the real master once we lost the lock.
+			if !m.state.Master {
+				services = m.withoutOwnService(services)
+			}
 
 			if len(services) == 0 {
 				m.logger.Warn("No (healthy) master service found in Consul catalog")
@@ -342,6 +369,26 @@ func (m *Manager) watchConsulMasterService() {
 			m.emit()
 		}
 	}
+}
+
+// withoutOwnService returns the service entries that do not point at the local Redis.
+// Without an announced host every node registers the same port-only address, so
+// nothing can be filtered.
+func (m *Manager) withoutOwnService(services []*consulapi.ServiceEntry) []*consulapi.ServiceEntry {
+	if m.config.announceHost == "" {
+		return services
+	}
+
+	others := make([]*consulapi.ServiceEntry, 0, len(services))
+	for _, service := range services {
+		if service.Service.Address == m.config.announceHost && service.Service.Port == m.config.announcePort {
+			continue
+		}
+
+		others = append(others, service)
+	}
+
+	return others
 }
 
 // handleConsulError is the error handler
